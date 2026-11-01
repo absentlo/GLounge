@@ -11,7 +11,7 @@ A small band of instruments for [REAPER](https://www.reaper.fm/), made for low-s
 | **Bass** | Ready |
 | **Electric guitar** | Ready |
 | **8-bit** | Ready |
-| Drums | Planned |
+| **Drums** | Ready |
 | Piano | Planned: a soft, felt-style piano rather than a concert grand |
 
 ## Install
@@ -83,6 +83,35 @@ A retro video game chip: four channels, simple waves and volume that moves in st
 | **Level** | Output volume. |
 
 With Noise, higher notes sound brighter, so low notes work for a snare or a rumble and high notes for a hi-hat. Pitch bend reaches 2 semitones up or down.
+
+## Drums
+
+![GLounge Drums](docs/drums.png)
+
+A small acoustic-style kit with no samples: it simulates sticks striking skins and metal, in a small room. It follows the General MIDI drum map, so it works with most drum MIDI.
+
+| Piece | MIDI notes |
+|---|---|
+| **Kick** | 35, 36 |
+| **Snare** | 38, 40 |
+| **Clap** | 39 |
+| **Toms** | 41, 43, 45, 47, 48, 50 |
+| **Closed hat** | 42, 44 |
+| **Open hat** | 46 |
+| **Crash** | 49, 52, 55, 57 |
+| **Ride** | 51, 53, 59 |
+
+| Knob | What it does |
+|---|---|
+| **Kick Tune, Decay** | How low it sits, and how long it rings. |
+| **Snare Tune, Snap** | The drum's pitch, and how much of the snare wires you hear. |
+| **Hats Tone, Open** | Higher is brighter. Open sets how long the open hat rings. |
+| **Toms Tune, Decay** | The pitch of all the toms, and how long they ring. |
+| **Room** | How much of the room you hear. At 0, the kit is dry and close. |
+| **Crunch** | Dirt across the whole kit, off by default. |
+| **Level** | Output volume. |
+
+Playing harder is louder and brighter, and no two hits are identical. A closed hat cuts a ringing open hat, like the real pedal. For a bigger space, add reverb after it.
 
 ## Developers
 

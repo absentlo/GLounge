@@ -11,15 +11,15 @@ PLUGIN = "bass.jsfx"
 
 
 def project(path, out, params, notes, seconds, rate, bend_at=None):
-    """notes: (start_beat, length_beats, midi_note). 120 BPM, 960 ticks per beat.
+    """notes: (start_beat, length_beats, midi_note[, velocity]). 120 BPM, 960 ticks per beat.
     bend_at: the beat where the pitch wheel jumps fully up."""
     src = open(os.path.join(ROOT, PLUGIN)).read()
     defaults = {int(n): v for n, v in re.findall(r"^slider(\d+):\w+=(-?[\d.]+)", src, re.M)}
     vals = " ".join(str(params.get(i, defaults.get(i, "-"))) for i in range(1, 65))
     events, last = [], 0
     for tick, status, note, vel in sorted(
-        [(int(s * 960), 0x90, n, 110) for s, _, n in notes]
-        + [(int((s + l) * 960), 0x80, n, 0) for s, l, n in notes]
+        [(int(s * 960), 0x90, n, v[0] if v else 110) for s, _, n, *v in notes]
+        + [(int((s + l) * 960), 0x80, n, 0) for s, l, n, *_ in notes]
         + ([(int(bend_at * 960), 0xE0, 127, 127)] if bend_at else [])
     ):
         events.append(f"E {tick - last} {status:02x} {note:02x} {vel:02x}")
@@ -121,9 +121,9 @@ def cents_off(x, rate, hz):
     return at
 
 
-def bright(x, rate):
-    """Share of the energy above 1 kHz. Three stages, or a bass fundamental leaks through and swamps it."""
-    k, hi = 1 - math.exp(-2 * math.pi * 1000 / rate), list(x)
+def bright(x, rate, hz=1000):
+    """Share of the energy above hz. Three stages, or a bass fundamental leaks through and swamps it."""
+    k, hi = 1 - math.exp(-2 * math.pi * hz / rate), list(x)
     for _ in range(3):
         y, out = 0, []
         for s in hi:
@@ -157,9 +157,22 @@ def main():
     for f in glob.glob(os.path.join(ROOT, "*.jsfx*")):
         shutil.copy(f, os.path.join(tmp, "cfg", "Effects"))
     open(os.path.join(tmp, "cfg", "reaper.ini"), "w").close()
-    good = bass_checks(tmp) & guitar_checks(tmp) & eightbit_checks(tmp)
+    good = name_checks() & bass_checks(tmp) & guitar_checks(tmp) & eightbit_checks(tmp) & drums_checks(tmp)
     print("PASS" if good else "FAILED")
     sys.exit(0 if good else 1)
+
+
+def name_checks():
+    """JSFX names ignore case, so count and COUNT are one variable. This bug is silent, and has bitten repeatedly."""
+    good = True
+    for path in glob.glob(os.path.join(ROOT, "*.jsfx*")):
+        code = re.sub(r"^(desc|slider\d+|import).*$|//.*|\"[^\"]*\"", "", open(path).read(), flags=re.M)
+        seen = {}
+        for word in re.findall(r"[A-Za-z_][A-Za-z_0-9]*", code):
+            seen.setdefault(word.lower(), set()).add(word)
+        clashes = [sorted(v) for v in seen.values() if len(v) > 1]
+        good &= check(not clashes, f"{os.path.basename(path)} has no names that differ only by case {clashes or ''}")
+    return good
 
 
 def level_at(x, rate, hz):
@@ -169,6 +182,111 @@ def level_at(x, rate, hz):
         total += s * (0.5 - 0.5 * math.cos(2 * math.pi * i / n)) * phase
         phase *= step
     return abs(total) / n
+
+
+def crossing_hz(x, rate):
+    """Pitch of a clean tone, from how often it crosses zero."""
+    crossings = sum(1 for a, b in zip(x, x[1:]) if a <= 0 < b)
+    return crossings * rate / len(x)
+
+
+def drums_checks(tmp):
+    global PLUGIN
+    PLUGIN = "drums.jsfx"
+    print("--- drums")
+    K_TUNE, K_DEC, S_TUNE, SNAP, H_TONE, H_DEC, T_TUNE, T_DEC, CRUNCH, LVL, ROOM = range(1, 12)
+    KIT = {"kick": 36, "snare": 38, "clap": 39, "low tom": 45, "mid tom": 47, "high tom": 50,
+           "closed hat": 42, "open hat": 46, "crash": 49, "ride": 51}
+    sr = 44100
+    good = True
+    dry = {CRUNCH: 0, ROOM: 0}
+    hit = lambda name, params=dry, note=None, vel=110, secs=4, rate=44100: render(
+        tmp, "d" + name.replace(" ", ""), params, [(0, 0.5, note if note else KIT[name], vel)], secs, rate=rate)[0]
+
+    # every piece makes a sound and then falls silent on its own, with the key already up
+    for name in KIT:
+        x = hit(name)
+        good &= check(rms(x[:sr // 10]) > 0.005 and peak(x) <= 1.001 and rms(x[-sr // 2:]) < 1e-3,
+                      f"{name} sounds, then falls silent (rms {rms(x[:sr // 10]):.3f}, peak {peak(x):.3f}, end {rms(x[-sr // 2:]):.5f})")
+
+    # notes outside the kit stay silent
+    x = render(tmp, "dnone", dry, [(0, 1, n) for n in (0, 30, 60, 90, 127)], 2)[0]
+    good &= check(peak(x) < 1e-6, f"notes outside the kit are silent (peak {peak(x):.6f})")
+
+    # the pieces sit where a kit should, from low to high
+    low = lambda x: crossing_hz(x[int(0.12 * sr):int(0.3 * sr)], sr)
+    k, lo, mid, hi = (low(hit(n)) for n in ("kick", "low tom", "mid tom", "high tom"))
+    good &= check(k < lo < mid < hi, f"kick and toms rise in pitch ({k:.0f} < {lo:.0f} < {mid:.0f} < {hi:.0f} Hz)")
+    good &= check(bright(hit("closed hat"), sr) > 3 * bright(hit("kick"), sr), "hats are far brighter than the kick")
+
+    # the kick settles on its Tune, at any sample rate
+    for rate in (44100, 96000):
+        x = hit("kick", {**dry, K_TUNE: 60, K_DEC: 1000}, rate=rate)
+        hz = crossing_hz(x[int(0.25 * rate):int(0.5 * rate)], rate)
+        good &= check(abs(hz - 60) < 5, f"kick Tune 60 sounds near 60 Hz at {rate} Hz ({hz:.1f})")
+
+    # knobs
+    a, b = time_to_fall(hit("kick", {**dry, K_DEC: 100}), sr), time_to_fall(hit("kick", {**dry, K_DEC: 1000}), sr)
+    good &= check(b > 2 * a, f"Kick Decay lengthens it ({a:.2f}s -> {b:.2f}s)")
+    a, b = bright(hit("snare", {**dry, SNAP: 0}), sr), bright(hit("snare", {**dry, SNAP: 1}), sr)
+    good &= check(b > 1.5 * a, f"Snap adds the snare wires ({a:.3f} -> {b:.3f})")
+    a, b = low(hit("snare", {**dry, SNAP: 0, S_TUNE: 120})[:sr // 3]), low(hit("snare", {**dry, SNAP: 0, S_TUNE: 320})[:sr // 3])
+    good &= check(b > a, f"Snare Tune raises it ({a:.0f} -> {b:.0f} Hz)")
+    high = lambda x: bright(x[:sr // 5], sr, 8000)
+    a, b = high(hit("open hat", {**dry, H_TONE: 3000})), high(hit("open hat", {**dry, H_TONE: 12000}))
+    good &= check(b > 1.2 * a, f"Hat Tone brightens the hats ({a:.3f} -> {b:.3f})")
+    a, b = time_to_fall(hit("open hat", {**dry, H_DEC: 100}), sr), time_to_fall(hit("open hat", {**dry, H_DEC: 1500}), sr)
+    good &= check(b > 2 * a, f"Open lengthens the open hat ({a:.2f}s -> {b:.2f}s)")
+    a, b = low(hit("low tom", {**dry, T_TUNE: 60})), low(hit("low tom", {**dry, T_TUNE: 160}))
+    good &= check(b > a, f"Tom Tune raises the toms ({a:.0f} -> {b:.0f} Hz)")
+    a, b = time_to_fall(hit("mid tom", {**dry, T_DEC: 100}), sr), time_to_fall(hit("mid tom", {**dry, T_DEC: 1000}), sr)
+    good &= check(b > 2 * a, f"Tom Decay lengthens them ({a:.2f}s -> {b:.2f}s)")
+    # distortion lifts the quiet parts towards the peaks
+    fat = lambda x: rms(x[:sr // 4]) / peak(x[:sr // 4])
+    a, b = fat(hit("kick", dry)), fat(hit("kick", {**dry, CRUNCH: 1}))
+    good &= check(b > 1.3 * a, f"Crunch thickens the hit ({a:.3f} -> {b:.3f})")
+    a, b = rms(hit("kick", dry)[int(0.6 * sr):int(0.9 * sr)]), rms(hit("kick", {**dry, ROOM: 1})[int(0.6 * sr):int(0.9 * sr)])
+    good &= check(b > 3 * max(a, 1e-5), f"Room adds a tail ({a:.5f} -> {b:.5f})")
+
+    # what makes it acoustic rather than a drum machine
+    x = hit("kick", {**dry, K_TUNE: 60})[int(0.005 * sr):int(0.1 * sr)]
+    a, b = level_at(x, sr, 60), level_at(x, sr, 60 * 1.59)
+    good &= check(b > 0.03 * a, f"the kick is a skin with several pitches, not one sine ({b / a:.3f} of the fundamental)")
+    x = hit("mid tom")[int(0.005 * sr):int(0.2 * sr)]
+    a, b = level_at(x, sr, 112), level_at(x, sr, 112 * 1.59)
+    good &= check(b > 0.03 * a, f"toms ring at several pitches too ({b / a:.3f} of the fundamental)")
+    a, b = bright(hit("snare", {**dry, SNAP: 0}, vel=30), sr), bright(hit("snare", {**dry, SNAP: 0}, vel=127), sr)
+    good &= check(b > 1.2 * a, f"harder hits are brighter, not only louder ({a:.3f} -> {b:.3f})")
+    # two hits in one render: rand repeats between renders, so separate renders would match
+    x = render(tmp, "dtwo", dry, [(0, 0.5, 38), (2, 0.5, 38)], 2)[0]
+    a, b = x[:sr // 5], x[sr:sr + sr // 5]
+    diff = rms([p - q for p, q in zip(a, b)]) / rms(a)
+    good &= check(diff > 0.05, f"no two hits are identical ({diff:.2f} apart)")
+    k_l, k_r, _ = render(tmp, "dkst", dry, [(0, 0.5, 36)], 1)
+    h_l, h_r, _ = render(tmp, "dhst", dry, [(0, 0.5, 46)], 1)
+    good &= check(rms([p - q for p, q in zip(k_l, k_r)]) < 0.05 * rms(k_l) and rms(h_r) > 1.3 * rms(h_l),
+                  f"the kick sits in the centre, the hats to one side (L {rms(h_l):.4f}, R {rms(h_r):.4f})")
+
+    # playing
+    a, b = rms(hit("snare", vel=30)[:sr // 10]), rms(hit("snare", vel=127)[:sr // 10])
+    good &= check(b > 2 * a, f"harder hits are louder ({a:.3f} -> {b:.3f})")
+    # the closed hat cuts a ringing open hat, like the real pedal
+    x = render(tmp, "dchoke", {**dry, H_DEC: 1500}, [(0, 0.5, 46), (1, 0.5, 42)], 3)[0]
+    y = render(tmp, "dring", {**dry, H_DEC: 1500}, [(0, 0.5, 46)], 3)[0]
+    a, b = rms(y[int(0.9 * sr):int(1.1 * sr)]), rms(x[int(0.9 * sr):int(1.1 * sr)])
+    good &= check(b < 0.7 * a, f"a closed hat cuts the open hat ({a:.4f} -> {b:.4f})")
+
+    # a busy pattern and a full-kit hit stay under the ceiling; nothing sticks afterwards
+    pattern = [(i * 0.25, 0.1, (36, 42, 38, 42)[i % 4]) for i in range(32)]
+    x = render(tmp, "dpat", {}, pattern, 5)[0]
+    good &= check(peak(x) < 0.99 and rms(x[int(4.5 * sr):]) < 1e-3, f"a busy pattern does not clip at the default level (peak {peak(x):.3f})")
+    x = render(tmp, "dall", {CRUNCH: 1, LVL: 6, ROOM: 1}, [(0, 0.5, n, 127) for n in KIT.values()], 5)[0]
+    good &= check(all(math.isfinite(s) for s in x) and peak(x) <= 1.001, f"the whole kit at once stays under the ceiling (peak {peak(x):.3f})")
+    # a roll with the room fully open must fade once it stops
+    roll = [(i * 0.0625, 0.05, 38, 127) for i in range(64)]
+    l, r, _ = render(tmp, "droll", {ROOM: 1}, roll, 8)
+    good &= check(all(math.isfinite(s) for s in l) and rms(l[6 * sr:]) < 1e-3, f"a fast roll in a full room fades away (end {rms(l[6 * sr:]):.5f})")
+    return good
 
 
 def eightbit_checks(tmp):
