@@ -11,7 +11,7 @@ if not exist "%REAPER%\Effects\" (
 )
 
 if not exist "%REAPER%\Effects\GLounge\" mkdir "%REAPER%\Effects\GLounge"
-copy /Y "%~dp0*.jsfx" "%REAPER%\Effects\GLounge\" >nul
+copy /Y "%~dp0*.jsfx*" "%REAPER%\Effects\GLounge\" >nul
 if errorlevel 1 (
   echo Could not copy the plugin. Is the folder read-only?
   pause

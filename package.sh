@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 rm -rf dist
 mkdir -p dist/GLounge
-cp -r ./*.jsfx README.md LICENSE docs dist/GLounge/
+cp -r ./*.jsfx* README.md LICENSE docs dist/GLounge/
 
 cp install.sh dist/GLounge/
 tar -czf dist/GLounge-Linux.tar.gz -C dist GLounge

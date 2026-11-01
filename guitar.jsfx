@@ -1,0 +1,89 @@
+desc:GLounge Guitar
+options:no_meter
+in_pin:none
+out_pin:Left
+out_pin:Right
+
+slider1:pluck=0.6<0,1,0.001>-Pluck
+slider2:pick=0.7<0,1,0.001>-Pick
+slider3:decay=6<0.5,20,0.01:log>-Decay
+slider4:tone=4500<500,12000,1:log>-Tone
+slider5:drive=0.25<0,1,0.001>-Drive
+slider6:out_db=0<-36,6,0.1>-Level
+slider7:pickup=0.5<0,1,0.001>-Pickup
+
+import glounge.jsfx-inc
+
+@init
+// six notes, like six strings
+strings_setup(6, 6500, 0.85);
+age = 0;
+
+function note_on(n, vel) local(v, best, low, score)
+(
+  // a free string first, then the quietest damped one, then the oldest ringing one
+  best = voices; low = 1000000000; v = voices;
+  loop(NV,
+    v[V_ST] == 1 && v[V_NOTE] == n ? damp(v); // the same note again takes a new string, so it does not click
+    score = v[V_ST] == 0 ? -1 : v[V_ST] == 2 ? v[V_ENV] : 1 + v[V_AGE];
+    score < low ? ( low = score; best = v; );
+    v += VS;
+  );
+  age += 1;
+  best[V_AGE] = age;
+  // shortcut: a seventh note cuts the oldest string at once, which can click; add spare strings if chords of 7+ need it
+  start_string(best, n, vel);
+);
+
+function note_off(n) local(v)
+(
+  v = voices;
+  loop(NV, v[V_NOTE] == n ? damp(v); v += VS; );
+);
+
+ui_setup();
+head("STRING");
+knob(1, "Pluck", "%.2f", 0, 1, 0.6, 0);
+knob(2, "Pick", "%.2f", 0, 1, 0.7, 0);
+knob(3, "Decay", "%.1f s", 0.5, 20, 6, 1);
+head("PICKUP");
+knob(7, "Position", "%.2f", 0, 1, 0.5, 0);
+head("AMP");
+knob(4, "Tone", "%.0f Hz", 500, 12000, 4500, 1);
+knob(5, "Drive", "%.2f", 0, 1, 0.25, 0);
+head("OUT");
+knob(6, "Level", "%.1f dB", -36, 6, 0, 0);
+
+@block
+pu_pos = 0.28 - 0.22 * pickup; // from the neck, warm and round, to the bridge, thin and bright
+amp_block(150);
+tune_all();
+sidx = 0;
+pend = midirecv(mofs, m1, m2, m3);
+
+@sample
+// MIDI, sample-accurate
+while (pend && mofs <= sidx) (
+  mst = m1 & 0xF0;
+  mst == 0x90 && m3 > 0 ? note_on(m2, m3) :
+  mst == 0x80 || mst == 0x90 ? note_off(m2) :
+  mst == 0xB0 && (m2 == 123 || m2 == 120) ? damp_all() :
+  mst == 0xE0 ? ( pb = (m3 * 128 + m2 - 8192) / 4096; ); // +/- 2 semitones, retuned at the next block
+  pend = midirecv(mofs, m1, m2, m3);
+);
+sidx += 1;
+
+spl0 = spl1 = amp(strings_tick() * 0.6);
+
+@gfx 448 125
+ui_draw("GLounge Guitar", 28) ? (
+  // a small guitar: wide body and a shorter neck than the bass's
+  c_ink();
+  gfx_circle(8, 19, 6, 1, 1);
+  gfx_circle(12, 15, 5, 1, 1);
+  pointer(12, 15, 0.785, 0, 8);
+  pointer(18, 9, 0.785, 0, 4);
+  pointer(19, 10, 0.785, 0, 3);
+  c_card();
+  gfx_circle(9, 18, 2, 1, 1);
+);

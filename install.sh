@@ -12,7 +12,7 @@ if [ ! -d "$reaper/Effects" ]; then
 fi
 
 mkdir -p "$reaper/Effects/GLounge"
-for f in "$here"/*.jsfx; do
+for f in "$here"/*.jsfx*; do
   install -m 644 "$f" "$reaper/Effects/GLounge/"
 done
 echo "Installed to $reaper/Effects/GLounge. Restart REAPER, or press F5 in the FX browser."

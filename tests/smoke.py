@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Renders GLounge Bass through REAPER and checks the audio. Run: python3 tests/smoke.py
+"""Renders the GLounge instruments through REAPER and checks the audio. Run: python3 tests/smoke.py
 Needs REAPER on PATH and a display. Uses a throwaway config, not your REAPER settings."""
-import atexit, cmath, math, os, re, shutil, struct, subprocess, sys, tempfile
+import atexit, cmath, glob, math, os, re, shutil, struct, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUCK, PICK, DECAY, TONE, DRIVE, LEVEL = 1, 2, 3, 4, 5, 6
+PICKUP = 7
 CLEAN = {DRIVE: 0, TONE: 8000}
+PLUGIN = "bass.jsfx"
 
 
 def project(path, out, params, notes, seconds, rate, bend_at=None):
     """notes: (start_beat, length_beats, midi_note). 120 BPM, 960 ticks per beat.
     bend_at: the beat where the pitch wheel jumps fully up."""
-    src = open(os.path.join(ROOT, "bass.jsfx")).read()
+    src = open(os.path.join(ROOT, PLUGIN)).read()
     defaults = {int(n): v for n, v in re.findall(r"^slider(\d+):\w+=(-?[\d.]+)", src, re.M)}
     vals = " ".join(str(params.get(i, defaults.get(i, "-"))) for i in range(1, 65))
     events, last = [], 0
@@ -47,7 +49,7 @@ def project(path, out, params, notes, seconds, rate, bend_at=None):
       LASTSEL 0
       DOCKED 0
       BYPASS 0 0 0
-      <JS bass.jsfx ""
+      <JS {PLUGIN} ""
         {vals}
       >
       FLOATPOS 0 0 0 0
@@ -152,8 +154,78 @@ def main():
     tmp = tempfile.mkdtemp(prefix="glounge-")
     atexit.register(shutil.rmtree, tmp, True)
     os.makedirs(os.path.join(tmp, "cfg", "Effects"))
-    shutil.copy(os.path.join(ROOT, "bass.jsfx"), os.path.join(tmp, "cfg", "Effects"))
+    for f in glob.glob(os.path.join(ROOT, "*.jsfx*")):
+        shutil.copy(f, os.path.join(tmp, "cfg", "Effects"))
     open(os.path.join(tmp, "cfg", "reaper.ini"), "w").close()
+    good = bass_checks(tmp) & guitar_checks(tmp)
+    print("PASS" if good else "FAILED")
+    sys.exit(0 if good else 1)
+
+
+def guitar_checks(tmp):
+    global PLUGIN
+    PLUGIN = "guitar.jsfx"
+    print("--- guitar")
+    good = True
+    chord = [(0, 4, n) for n in (40, 47, 52, 55, 59, 64)]
+
+    l, r, sr = render(tmp, "gdefault", {}, chord, 4)
+    good &= check(0.02 < rms(l[:sr]) and peak(l) <= 1.001, f"a full chord sounds, within the ceiling (rms {rms(l[:sr]):.3f}, peak {peak(l):.3f})")
+
+    for rate in (44100, 96000):
+        for note, name in ((40, "E2"), (45, "A2"), (50, "D3"), (55, "G3"), (59, "B3"), (64, "E4"), (76, "E5"), (88, "E6")):
+            l, r, sr = render(tmp, f"gtune{note}", {**CLEAN, TONE: 12000, DECAY: 20}, [(0, 4, note)], 2, rate=rate)
+            hz = 440 * 2 ** ((note - 69) / 12)
+            x = l[int(0.1 * sr):int(0.9 * sr)]
+            if rate != 44100:
+                x = x[::2]  # shortcut: keeps the scan quick; 48 kHz is plenty for these notes
+            c = cents_off(x, sr // (2 if rate != 44100 else 1), hz)
+            good &= check(abs(c) <= 3, f"{name} in tune at {rate} Hz ({c:+d} cents)")
+
+    # two notes at once both sound
+    l, r, sr = render(tmp, "gpoly", {**CLEAN, TONE: 12000, DECAY: 20}, [(0, 4, 40), (0, 4, 47)], 2)
+    x = l[int(0.2 * sr):int(1.2 * sr)]
+    good &= check(abs(cents_off(x, sr, 82.41)) <= 3 and abs(cents_off(x, sr, 123.47)) <= 3, "two notes ring together, both in tune")
+
+    # note off stops every string, including when more notes than strings were played
+    l, r, sr = render(tmp, "goff", {}, [(0, 1, 40 + i) for i in range(9)], 3)
+    good &= check(rms(l[:sr // 2]) > 0.01, "nine notes at once still sound")
+    good &= check(rms(l[int(2 * sr):]) < 1e-3, f"note off damps every string (rms {rms(l[int(2 * sr):]):.5f})")
+
+    # repeating one note must not stack up or click
+    fast = [(i * 0.125, 0.5, 52) for i in range(32)]
+    l, r, sr = render(tmp, "gfast", {}, fast, 4)
+    good &= check(peak(l) < 1, f"a fast repeated note stays under the ceiling (peak {peak(l):.3f})")
+
+    a = time_to_fall(render(tmp, "gshort", {**CLEAN, DECAY: 1}, [(0, 8, 52)], 6)[0], sr)
+    b = time_to_fall(render(tmp, "glong", {**CLEAN, DECAY: 12}, [(0, 8, 52)], 6)[0], sr)
+    good &= check(b > 2 * a, f"Decay lengthens the note ({a:.2f}s -> {b:.2f}s to fall 20 dB)")
+
+    clean = {DRIVE: 0, TONE: 12000}
+    a = bright(render(tmp, "gneck", {**clean, PICKUP: 0}, [(0, 2, 52)], 1)[0][:sr // 2], sr)
+    b = bright(render(tmp, "gbridge", {**clean, PICKUP: 1}, [(0, 2, 52)], 1)[0][:sr // 2], sr)
+    good &= check(b > 1.1 * a, f"Position brightens the sound towards the bridge ({a:.3f} -> {b:.3f})")
+
+    a = bright(render(tmp, "gdark", {DRIVE: 0, TONE: 500}, [(0, 2, 52)], 1)[0][:sr // 2], sr)
+    b = bright(render(tmp, "gopen", clean, [(0, 2, 52)], 1)[0][:sr // 2], sr)
+    good &= check(b > 1.5 * a, f"Tone opens the sound ({a:.3f} -> {b:.3f})")
+
+    a = bright(render(tmp, "gclean", clean, [(0, 2, 40)], 1)[0][:sr // 2], sr)
+    b = bright(render(tmp, "gdirty", {DRIVE: 1, TONE: 12000}, [(0, 2, 40)], 1)[0][:sr // 2], sr)
+    good &= check(b > 1.2 * a, f"Drive adds harmonics ({a:.3f} -> {b:.3f})")
+
+    worst = {PLUCK: 1, PICK: 1, DECAY: 20, TONE: 12000, DRIVE: 1, LEVEL: -24, PICKUP: 1}
+    for note in (0, 40, 76, 100, 127):
+        l, r, sr = render(tmp, f"gstress{note}", worst, [(0, 32, note)], 20)
+        a, b = rms(l[sr // 2:sr]), rms(l[18 * sr:19 * sr])
+        good &= check(all(math.isfinite(s) for s in l) and b <= a + 1e-6, f"MIDI note {note} is stable (rms {a:.4f} -> {b:.4f})")
+    return good
+
+
+def bass_checks(tmp):
+    global PLUGIN
+    PLUGIN = "bass.jsfx"
+    print("--- bass")
     good = True
 
     # defaults: audible and under the ceiling
@@ -213,9 +285,7 @@ def main():
     fast = [(i * 0.25, 0.2, 33 + (i % 2) * 7) for i in range(32)]
     l, r, sr = render(tmp, "fast", {}, fast, 5)
     good &= check(peak(l) < 1, f"fast playing stays under the ceiling (peak {peak(l):.3f})")
-
-    print("PASS" if good else "FAILED")
-    sys.exit(0 if good else 1)
+    return good
 
 
 if __name__ == "__main__":
