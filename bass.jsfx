@@ -1,0 +1,325 @@
+desc:GLounge Bass
+options:no_meter
+in_pin:none
+out_pin:Left
+out_pin:Right
+
+slider1:pluck=0.5<0,1,0.001>-Pluck
+slider2:pick=0.25<0,1,0.001>-Pick
+slider3:decay=4<0.3,12,0.01:log>-Decay
+slider4:tone=2000<200,8000,1:log>-Tone
+slider5:drive=0.15<0,1,0.001>-Drive
+slider6:out_db=0<-36,6,0.1>-Level
+
+@init
+ext_noinit = 1; // keep the tail when playback starts
+TWO_PI = 2 * $pi;
+
+memtop = 0;
+function alloc(n) local(p) ( p = memtop; memtop += n; p; );
+
+// ---- plucked string: a delay line one period long, fed back through a soft lowpass
+// Two strings, so a new note can start while the last one is damped, without a click.
+NV = 2;
+V_ST = 0;   // 0 off, 1 ringing, 2 damped by the hand
+V_NOTE = 1; V_BUF = 2; V_W = 3; V_N = 4;
+V_C = 5; V_A1 = 6; V_A2 = 7; // fractional delay: an allpass, which keeps the tuning without dulling the sound
+V_LP = 8; V_G = 9; V_ENV = 10; V_PU = 11;
+VS = 12;
+voices = alloc(NV * VS);
+BN = ceil(0.15 * srate) + 8; // long enough for MIDI note 0 bent down
+voices[V_BUF] = alloc(BN);
+voices[VS + V_BUF] = alloc(BN);
+memset(voices[V_BUF], 0, 2 * BN);
+LOOP_B = exp(-TWO_PI * 3500 / srate);
+RELEASE_T = 0.25; // how fast the hand damps a released string, in seconds
+env_rel = exp(-6.9 / (0.5 * srate));
+cur = voices;
+pb = 0;
+dc_k = 1 - TWO_PI * 25 / srate;
+
+// sets delay length and feedback, so pitch and decay stay right at every note
+function tune(v) local(f, w, cs, sn, re, delay, rest, n, d)
+(
+  f = min(440 * 2 ^ ((v[V_NOTE] - 69 + pb) / 12), srate * 0.2);
+  w = TWO_PI * f / srate; cs = cos(w); sn = sin(w);
+  re = 1 - LOOP_B * cs;
+  delay = atan2(LOOP_B * sn, re) / w; // the lowpass delays the wave too, so count it in the period
+  rest = srate / f - delay;
+  n = max(2, floor(rest - 0.5));
+  d = rest - n;
+  v[V_N] = n;
+  v[V_C] = (1 - d) / (1 + d);
+  v[V_PU] = max(1, floor(n * 0.21));
+  // below 1 at DC too, or the string would grow instead of decaying
+  v[V_G] = min(0.99995, 10 ^ (-3 / (f * (v[V_ST] == 2 ? RELEASE_T : decay))) * sqrt(1 - 2 * LOOP_B * cs + LOOP_B * LOOP_B) / (1 - LOOP_B));
+);
+
+// a pluck is the shape the string holds at the moment it is let go
+function pluck_string(v, vel) local(b, w, n, i, p, x, y, k, pos, nz, amp)
+(
+  b = v[V_BUF]; w = v[V_W]; n = v[V_N];
+  memset(b, 0, BN);
+  p = 0.35 - 0.23 * pick; // fingers pluck further from the bridge than a pick does
+  k = 0.05 + 0.9 * pluck * pluck * (0.4 + 0.6 * vel);
+  nz = pick * 0.25;
+  amp = 0.35 + 0.65 * vel;
+  y = 0; i = 0;
+  loop(n,
+    x = i / n; x = x < p ? x / p : (1 - x) / (1 - p);
+    x = x - 0.5 + (rand(2) - 1) * nz; // around zero, so the string carries no DC
+    y += k * (x - y);
+    pos = w - n + i; pos < 0 ? pos += BN;
+    b[pos] = y * amp;
+    i += 1;
+  );
+  v[V_A1] = v[V_A2] = v[V_LP] = 0;
+);
+
+function note_on(n, vel) local(v)
+(
+  cur[V_ST] ? ( cur[V_ST] = 2; tune(cur); );
+  cur = cur == voices ? voices + VS : voices;
+  v = cur;
+  v[V_ST] = 1; v[V_NOTE] = n; v[V_ENV] = 1;
+  tune(v);
+  pluck_string(v, vel / 127);
+);
+
+function damp(v) ( v[V_ST] == 1 ? ( v[V_ST] = 2; tune(v); ); );
+
+// ---- UI table
+ROW_N = 8; // slider, name, format, min, max, default, log
+ptab = alloc(ROW_N * 16);
+freembuf(memtop);
+np = 0;
+g_redraw = 1;
+function entry(sl, name, fmt, mn, mx, def, lg) local(e)
+(
+  e = ptab + np * ROW_N;
+  e[0] = sl; e[1] = name; e[2] = fmt; e[3] = mn; e[4] = mx; e[5] = def; e[6] = lg;
+  np += 1;
+);
+function c_paper() ( gfx_set(0.95, 0.94, 0.92); );
+function c_card() ( gfx_set(0.90, 0.89, 0.86); );
+function c_ink() ( gfx_set(0.27, 0.27, 0.27); );
+function c_soft() ( gfx_set(0.62, 0.61, 0.59); );
+// built from filled discs because they draw rounder than gfx_arc: disc, cover the unused
+// part with the section colour, inner disc, then round the two ends
+function ring(cx, cy, r, w, a0, a1) local(n, i, a, b, sp, big, mid)
+(
+  gfx_circle(cx, cy, r, 1, 1);
+  sp = 6.2832 - (a1 - a0); n = ceil(sp); big = (r + 2) / cos(sp / n / 2);
+  mid = r - w / 2;
+  c_card();
+  i = 0;
+  loop(n,
+    a = a1 + sp * i / n; b = a1 + sp * (i + 1) / n;
+    gfx_triangle(cx, cy, cx + sin(a) * big, cy - cos(a) * big, cx + sin(b) * big, cy - cos(b) * big);
+    i += 1;
+  );
+  gfx_circle(cx, cy, r - w, 1, 1);
+  c_ink();
+  gfx_circle(cx + sin(a0) * mid, cy - cos(a0) * mid, w / 2, 1, 1);
+  gfx_circle(cx + sin(a1) * mid, cy - cos(a1) * mid, w / 2, 1, 1);
+);
+// three close lines, so the stroke is solid at every angle
+function pointer(cx, cy, a, r0, r1) local(dx, dy, nx, ny, o)
+(
+  dx = sin(a); dy = -cos(a); nx = -dy; ny = dx; o = -0.5;
+  loop(3,
+    gfx_line(cx + nx * o + dx * r0, cy + ny * o + dy * r0, cx + nx * o + dx * r1, cy + ny * o + dy * r1, 1);
+    o += 0.5;
+  );
+);
+// headers keep their knob count in the min slot
+function head(name) ( group_e = ptab + np * ROW_N; entry(0, name, 0, 0, 0, 0, 0); );
+function knob(sl, name, fmt, mn, mx, def, lg) ( entry(sl, name, fmt, mn, mx, def, lg); group_e[3] += 1; );
+
+head("STRING");
+knob(1, "Pluck", "%.2f", 0, 1, 0.5, 0);
+knob(2, "Pick", "%.2f", 0, 1, 0.25, 0);
+knob(3, "Decay", "%.1f s", 0.3, 12, 4, 1);
+head("AMP");
+knob(4, "Tone", "%.0f Hz", 200, 8000, 2000, 1);
+knob(5, "Drive", "%.2f", 0, 1, 0.15, 0);
+head("OUT");
+knob(6, "Level", "%.1f dB", -36, 6, 0, 0);
+
+@block
+tone_k = 1 - exp(-TWO_PI * tone / srate);
+drv_g = 1 + drive * drive * 30;
+drv_out = 1 / (1 + drive);
+out_g = 10 ^ (out_db / 20);
+voices[V_ST] ? tune(voices);
+voices[VS + V_ST] ? tune(voices + VS);
+
+sidx = 0;
+pend = midirecv(mofs, m1, m2, m3);
+
+@sample
+// ---- MIDI, sample-accurate
+while (pend && mofs <= sidx) (
+  mst = m1 & 0xF0;
+  mst == 0x90 && m3 > 0 ? note_on(m2, m3) :
+  // shortcut: one note at a time with no memory of held notes, so a released note does not bring back an older one; keep a note stack if legato playing needs it
+  mst == 0x80 || mst == 0x90 ? ( cur[V_NOTE] == m2 ? damp(cur); ) :
+  mst == 0xB0 && (m2 == 123 || m2 == 120) ? ( damp(voices); damp(voices + VS); ) :
+  mst == 0xE0 ? ( pb = (m3 * 128 + m2 - 8192) / 4096; ); // +/- 2 semitones, retuned at the next block
+  pend = midirecv(mofs, m1, m2, m3);
+);
+sidx += 1;
+
+// ---- strings
+s = 0;
+v = voices;
+loop(NV,
+  v[V_ST] ? (
+    buf = v[V_BUF]; w = v[V_W];
+    r = w - v[V_N]; r < 0 ? r += BN;
+    x = buf[r];
+    // the pickup sits along the string, so it hears the wave and its reflection
+    r = w - v[V_PU]; r < 0 ? r += BN;
+    e = v[V_ENV];
+    s += (x - 0.6 * buf[r]) * e;
+    y = v[V_C] * x + v[V_A1] - v[V_C] * v[V_A2];
+    v[V_A1] = x; v[V_A2] = y;
+    lp = v[V_LP] + (1 - LOOP_B) * (y - v[V_LP]);
+    v[V_LP] = lp;
+    buf[w] = lp * v[V_G];
+    w += 1; v[V_W] = w >= BN ? 0 : w;
+    v[V_ST] == 2 ? (
+      e *= env_rel;
+      v[V_ENV] = e;
+      e < 0.001 ? v[V_ST] = 0;
+    );
+  );
+  v += VS;
+);
+
+// ---- amp. The offset keeps these filters out of slow denormals once the string stops.
+dc_y = s - dc_x + dc_k * dc_y + 0.000000000000001;
+dc_x = s;
+s = dc_y;
+drive > 0 ? ( x = s * drv_g; s = x / (1 + abs(x)) * (1 + drive * 0.5) * drv_out; );
+t1 += tone_k * (s - t1);
+t2 += tone_k * (t1 - t2);
+
+// hard ceiling: the last line of defence for speakers and ears
+spl0 = spl1 = max(-1, min(1, t2 * out_g));
+
+@gfx 384 125
+// this runs on the UI thread: use only g_ variables, never the ones @sample writes
+gfx_clear = -1; // keep the last frame, so an idle window costs almost nothing
+g_now = time_precise();
+g_btn = mouse_cap & 3;
+g_press = g_btn && !g_last;
+// a long gap between frames means the window was closed and may have lost its picture
+g_dirty = g_redraw || g_btn || g_last || gfx_w != g_w || gfx_h != g_h || g_now - g_prev > 0.25;
+g_prev = g_now;
+!g_dirty ? (
+  // automation and presets move knobs too
+  g_i = 0;
+  loop(np,
+    g_e = ptab + g_i * ROW_N;
+    g_e[0] > 0 && slider(g_e[0]) != g_e[7] ? g_dirty = 1;
+    g_i += 1;
+  );
+);
+
+!g_btn && g_drag ? ( slider_automate(2 ^ (g_drag - 1), 1); g_drag = 0; );
+
+g_dirty ? (
+  g_redraw = 0; g_w = gfx_w; g_h = gfx_h;
+  g_mg = 3; g_top = 28; g_hd = 20;
+  g_rh = gfx_h - g_top;
+  g_cell = (gfx_w - g_mg * 4) / 6;
+  gfx_setfont(1, "Arial", 12);
+  g_lh = gfx_texth;
+  gfx_setfont(2, "Arial", 12, 'b');
+  gfx_setfont(3, "Arial", 16, 'b');
+
+  c_paper(); gfx_rect(0, 0, gfx_w, gfx_h);
+
+  // a small bass guitar: two-part body, long neck, then headstock
+  c_ink();
+  gfx_circle(9, 19, 5, 1, 1);
+  gfx_circle(13, 15, 4, 1, 1);
+  pointer(13, 15, 0.785, 0, 13);
+  pointer(23, 5, 0.785, 0, 4);
+  pointer(24, 6, 0.785, 0, 3);
+  c_card();
+  pointer(8, 20, 0.785, 0, 4); // pickup, so the body does not read as a blob
+
+  c_ink();
+  gfx_setfont(3);
+  gfx_x = 32; gfx_y = 14 - gfx_texth / 2; gfx_drawstr("GLounge Bass");
+
+  gfx_setfont(1);
+  g_s = "Ctrl: fine    Right-click: reset";
+  gfx_measurestr(g_s, g_tw, g_th);
+  c_soft(); gfx_x = gfx_w - g_mg - 4 - g_tw; gfx_y = 14 - g_lh / 2; gfx_drawstr(g_s);
+
+  g_y = g_top; g_x = 0; g_i = 0;
+  loop(np,
+    g_e = ptab + g_i * ROW_N;
+    g_sl = g_e[0];
+    g_sl == 0 ? (
+      g_x += g_mg;
+      c_card(); gfx_rect(g_x, g_y, g_e[3] * g_cell, g_rh - g_mg);
+      gfx_setfont(2);
+      c_ink();
+      gfx_x = g_x + 5; gfx_y = g_y + (g_hd - gfx_texth) / 2; gfx_drawstr(g_e[1]);
+    ) : (
+      gfx_setfont(1);
+      g_mn = g_e[3]; g_mx = g_e[4];
+      g_zt = g_y + g_hd; g_zh = g_rh - g_mg - g_hd;
+      g_v = slider(g_sl);
+      g_n = g_e[6] ? log(g_v / g_mn) / log(g_mx / g_mn) : (g_v - g_mn) / (g_mx - g_mn);
+
+      g_press && mouse_x >= g_x && mouse_x < g_x + g_cell && mouse_y >= g_zt && mouse_y < g_zt + g_zh ? (
+        mouse_cap & 2 ? (
+          slider(g_sl) = g_e[5];
+          slider_automate(2 ^ (g_sl - 1));
+          slider_automate(2 ^ (g_sl - 1), 1);
+        ) : (
+          g_drag = g_sl; g_dn = g_n; g_ly = mouse_y;
+        );
+      );
+      g_drag == g_sl && mouse_y != g_ly ? (
+        // knobs turn with vertical drags: 200 px is the full range, 2000 px with Ctrl
+        g_dn = max(0, min(1, g_dn + (g_ly - mouse_y) / (mouse_cap & 4 ? 2000 : 200)));
+        g_ly = mouse_y;
+        slider(g_sl) = g_e[6] ? g_mn * (g_mx / g_mn) ^ g_dn : g_mn + (g_mx - g_mn) * g_dn;
+        slider_automate(2 ^ (g_sl - 1));
+      );
+      g_v = slider(g_sl);
+      g_e[7] = g_v;
+      g_n = g_e[6] ? log(g_v / g_mn) / log(g_mx / g_mn) : (g_v - g_mn) / (g_mx - g_mn);
+
+      g_r = max(4, floor(min(g_cell * 0.3, (g_zh - 2 * g_lh - 8) / 2)));
+      g_cx = floor(g_x + g_cell / 2);
+      g_cy = floor(g_zt + g_zh / 2 - 1);
+
+      // range runs from 7 to 5 o'clock
+      g_a = -2.356 + 4.712 * g_n;
+      c_ink();
+      ring(g_cx, g_cy, g_r, 3, -2.356, g_a);
+      gfx_circle(g_cx, g_cy, g_r * 0.7, 1, 1);
+      c_paper();
+      pointer(g_cx, g_cy, g_a, g_r * 0.2, g_r * 0.7);
+
+      // text last: the ring's cover reaches slightly past the ring
+      c_ink();
+      gfx_measurestr(g_e[1], g_tw, g_th);
+      gfx_x = g_cx - g_tw / 2; gfx_y = g_cy - g_r - g_lh - 3; gfx_drawstr(g_e[1]);
+      sprintf(#g_val, g_e[2], g_v);
+      gfx_measurestr(#g_val, g_tw, g_th);
+      gfx_x = g_cx - g_tw / 2; gfx_y = g_cy + g_r + 3; gfx_drawstr(#g_val);
+
+      g_x += g_cell;
+    );
+    g_i += 1;
+  );
+);
+g_last = g_btn;
