@@ -36,7 +36,7 @@ def project(path, out, params, notes, seconds, rate, bend_at=None):
   RENDER_RESAMPLE 3 0 1
   RENDER_STEMS 0
   RENDER_DITHER 0
-  SAMPLERATE {rate} 0 0
+  SAMPLERATE {rate} 1 0
   <RENDER_CFG
     ZXZhdyABAA==
   >
@@ -157,9 +157,93 @@ def main():
     for f in glob.glob(os.path.join(ROOT, "*.jsfx*")):
         shutil.copy(f, os.path.join(tmp, "cfg", "Effects"))
     open(os.path.join(tmp, "cfg", "reaper.ini"), "w").close()
-    good = bass_checks(tmp) & guitar_checks(tmp)
+    good = bass_checks(tmp) & guitar_checks(tmp) & eightbit_checks(tmp)
     print("PASS" if good else "FAILED")
     sys.exit(0 if good else 1)
+
+
+def level_at(x, rate, hz):
+    n = len(x)
+    step, phase, total = cmath.exp(-2j * math.pi * hz / rate), 1 + 0j, 0j
+    for i, s in enumerate(x):
+        total += s * (0.5 - 0.5 * math.cos(2 * math.pi * i / n)) * phase
+        phase *= step
+    return abs(total) / n
+
+
+def eightbit_checks(tmp):
+    global PLUGIN
+    PLUGIN = "8bit.jsfx"
+    print("--- 8-bit")
+    WAVE, CRUSH, ATK, DEC, SUS, REL, VIB, ARP = 1, 2, 3, 4, 5, 6, 7, 8
+    names = ("Pulse 12", "Pulse 25", "Pulse 50", "Triangle")
+    good = True
+    held = {CRUSH: 0, SUS: 1}
+
+    l, r, sr = render(tmp, "8default", {}, [(0, 4, 60)], 4)
+    good &= check(0.02 < rms(l[:sr]) and peak(l) <= 1.001, f"default sounds, within the ceiling (rms {rms(l[:sr]):.3f}, peak {peak(l):.3f})")
+
+    for rate in (44100, 96000):
+        for wave, name in enumerate(names):
+            for note in (36, 60, 84):
+                l, r, sr = render(tmp, f"8t{wave}{note}", {**held, WAVE: wave}, [(0, 4, note)], 1, rate=rate)
+                c = cents_off(l[int(0.1 * sr):int(0.5 * sr)], sr, 440 * 2 ** ((note - 69) / 12))
+                good &= check(abs(c) <= 3, f"{name} note {note} in tune at {rate} Hz ({c:+d} cents)")
+
+    # the noise wave has a pitch-like colour that follows the note
+    a = bright(render(tmp, "8nlo", {**held, WAVE: 4}, [(0, 2, 36)], 1)[0][:sr // 2], 44100)
+    b = bright(render(tmp, "8nhi", {**held, WAVE: 4}, [(0, 2, 84)], 1)[0][:sr // 2], 44100)
+    good &= check(b > 1.5 * a, f"noise gets brighter with higher notes ({a:.3f} -> {b:.3f})")
+
+    # four notes sound together; a fifth takes a channel without getting stuck
+    sr = 44100
+    l, r, _ = render(tmp, "8poly", {**held, WAVE: 2}, [(0, 4, 48), (0, 4, 55)], 2)
+    x = l[int(0.2 * sr):int(1.2 * sr)]
+    good &= check(abs(cents_off(x, sr, 130.81)) <= 3 and abs(cents_off(x, sr, 196.0)) <= 3, "two notes sound together, both in tune")
+    l, r, _ = render(tmp, "8off", {REL: 50}, [(0, 1, 48 + i) for i in range(7)], 3)
+    good &= check(rms(l[:sr // 2]) > 0.01, "seven notes at once still sound")
+    good &= check(rms(l[int(1.5 * sr):]) < 1e-4, f"no stuck notes after stealing (rms {rms(l[int(1.5 * sr):]):.6f})")
+
+    # the arp plays one key at a time, in turn, then stops with the keys
+    chord = [(0, 2, 48), (0, 2, 55), (0, 2, 64)]
+    pitches = (130.81, 196.0, 329.63)
+    l, r, _ = render(tmp, "8arp", {**held, WAVE: 2, ARP: 5, REL: 50}, chord, 3)
+    tops = []
+    for step in range(3):
+        x = l[int((step * 0.2 + 0.03) * sr):int((step * 0.2 + 0.17) * sr)]
+        levels = [level_at(x, sr, p) for p in pitches]
+        tops.append(levels.index(max(levels)))
+    good &= check(tops == [0, 1, 2], f"the arp steps through the held keys in turn ({tops})")
+    good &= check(rms(l[int(1.5 * sr):]) < 1e-4, f"the arp stops when the keys are up (rms {rms(l[int(1.5 * sr):]):.6f})")
+    l, r, _ = render(tmp, "8arp1", {**held, WAVE: 2, ARP: 8, REL: 50}, [(0, 1, 48), (0.5, 1, 55)], 3)
+    good &= check(rms(l[int(1.5 * sr):]) < 1e-4, "overlapping keys under the arp leave nothing stuck")
+
+    # the knobs do what their names say
+    a = bright(render(tmp, "8c0", {CRUSH: 0, WAVE: 3, SUS: 1}, [(0, 2, 60)], 1)[0][:sr // 2], sr)
+    b = bright(render(tmp, "8c1", {CRUSH: 1, WAVE: 3, SUS: 1}, [(0, 2, 60)], 1)[0][:sr // 2], sr)
+    good &= check(b != a and b > a, f"Crush adds grit ({a:.3f} -> {b:.3f})")
+    head = lambda x: rms(x[int(0.02 * sr):int(0.1 * sr)])
+    a = head(render(tmp, "8a0", {**held, ATK: 1}, [(0, 2, 60)], 1)[0])
+    b = head(render(tmp, "8a1", {**held, ATK: 2000}, [(0, 2, 60)], 1)[0])
+    good &= check(a > 5 * b, f"Attack slows the start ({a:.3f} -> {b:.3f})")
+    x = render(tmp, "8s", {CRUSH: 0, SUS: 0, DEC: 100}, [(0, 4, 60)], 2)[0]
+    good &= check(rms(x[int(1.2 * sr):int(1.8 * sr)]) < 1e-4 and rms(x[:sr // 20]) > 0.02, "Decay with Sustain at 0 falls to silence while a key is held")
+    a = rms(render(tmp, "8r0", {**held, REL: 5}, [(0, 1, 60)], 2)[0][int(0.56 * sr):int(0.7 * sr)])
+    b = rms(render(tmp, "8r1", {**held, REL: 3000}, [(0, 1, 60)], 2)[0][int(0.56 * sr):int(0.7 * sr)])
+    good &= check(b > 5 * max(a, 1e-4), f"Release lengthens the tail ({a:.4f} -> {b:.4f})")
+    a = level_at(render(tmp, "8v0", {**held, WAVE: 2}, [(0, 4, 60)], 2)[0][sr // 4:sr + sr // 4], sr, 261.63)
+    b = level_at(render(tmp, "8v1", {**held, WAVE: 2, VIB: 100}, [(0, 4, 60)], 2)[0][sr // 4:sr + sr // 4], sr, 261.63)
+    good &= check(a > 1.5 * b, f"Vibrato spreads the pitch ({a:.4f} -> {b:.4f})")
+
+    l, r, _ = render(tmp, "8bend", {**held, WAVE: 2}, [(0, 8, 60)], 4, bend_at=2)
+    c = cents_off(l[int(0.1 * sr):int(0.9 * sr)], sr, 261.63), cents_off(l[int(1.2 * sr):int(2.2 * sr)], sr, 293.66)
+    good &= check(abs(c[0]) <= 3 and abs(c[1]) <= 3, f"pitch bend reaches 2 semitones ({c[0]:+d} then {c[1]:+d} cents)")
+
+    # every wave across the whole MIDI range, loud and crushed: finite, under the ceiling
+    for wave in range(5):
+        l, r, _ = render(tmp, f"8x{wave}", {WAVE: wave, CRUSH: 1, 9: 6}, [(i * 0.1, 0.5, i) for i in range(0, 128, 9)], 4)
+        good &= check(all(math.isfinite(s) for s in l) and peak(l) <= 1.001, f"wave {wave} stays finite across every note (peak {peak(l):.3f})")
+    return good
 
 
 def guitar_checks(tmp):

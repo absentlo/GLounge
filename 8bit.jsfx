@@ -1,0 +1,222 @@
+desc:GLounge 8-bit
+options:no_meter
+in_pin:none
+out_pin:Left
+out_pin:Right
+
+slider1:wave=1<0,4,1{Pulse 12,Pulse 25,Pulse 50,Triangle,Noise}>-Wave
+slider2:crush=0.2<0,1,0.001>-Crush
+slider3:atk_ms=1<1,2000,1:log>-Attack
+slider4:dec_ms=300<5,3000,1:log>-Decay
+slider5:sus=0.6<0,1,0.001>-Sustain
+slider6:rel_ms=80<5,3000,1:log>-Release
+slider7:vibrato=0<0,100,0.1>-Vibrato
+slider8:arp=0<0,40,0.1>-Arp
+slider9:out_db=0<-36,6,0.1>-Level
+
+import glounge.jsfx-inc
+
+@init
+// four channels, like the chips this imitates
+CHANNELS = 4;
+C_ST = 0;   // 0 off, 1 attack, 2 decay/sustain, 3 release
+C_NOTE = 1; C_ENV = 2; C_PH = 3; C_INC = 4; C_LFSR = 5; C_AGE = 6;
+STRIDE = 7;
+chans = alloc(CHANNELS * STRIDE);
+MAX_HELD = 16;
+held = alloc(MAX_HELD);
+memset(chans, 0, CHANNELS * STRIDE);
+n_held = 0; arp_i = 0; arp_ph = 0; age = 0; ctl = 0; vib_ph = 0; vib = 0; pb = 0;
+hold_left = 0; hold_s = 0;
+dc_k = 1 - TWO_PI * 25 / srate;
+
+function chan_start(c, n)
+(
+  c[C_ST] = 1; c[C_NOTE] = n; c[C_ENV] = 0; c[C_PH] = 0; c[C_LFSR] = 1;
+  ctl = 0; // compute its pitch before its first sample
+);
+
+function note_on(n) local(c, best, low, score, i, found)
+(
+  found = 0; i = 0;
+  loop(n_held, held[i] == n ? found = 1; i += 1; );
+  !found && n_held < MAX_HELD ? ( held[n_held] = n; n_held += 1; );
+
+  arp > 0 ? (
+    n_held == 1 ? ( arp_i = 0; arp_ph = 0; chan_start(chans, n); );
+  ) : (
+    // a free channel first, then one fading out, then the oldest
+    best = chans; low = 1000000000; c = chans;
+    loop(CHANNELS,
+      score = c[C_ST] == 0 ? -1 : c[C_ST] == 3 ? c[C_ENV] : 1 + c[C_AGE];
+      score < low ? ( low = score; best = c; );
+      c += STRIDE;
+    );
+    age += 1;
+    best[C_AGE] = age;
+    chan_start(best, n);
+  );
+);
+
+function note_off(n) local(c, i, j)
+(
+  i = 0; j = 0;
+  loop(n_held,
+    held[i] != n ? ( held[j] = held[i]; j += 1; );
+    i += 1;
+  );
+  n_held = j;
+  arp_i >= n_held ? arp_i = 0;
+
+  c = chans;
+  loop(CHANNELS,
+    // while the arp runs, its channel only stops when every key is up
+    arp > 0 && c == chans ? (
+      n_held == 0 && c[C_ST] && c[C_ST] < 3 ? c[C_ST] = 3;
+    ) : (
+      c[C_NOTE] == n && c[C_ST] && c[C_ST] < 3 ? c[C_ST] = 3;
+    );
+    c += STRIDE;
+  );
+);
+
+function all_off() local(c)
+(
+  n_held = 0;
+  c = chans;
+  loop(CHANNELS, c[C_ST] && c[C_ST] < 3 ? c[C_ST] = 3; c += STRIDE; );
+);
+
+ui_setup();
+ui_labels[0] = "Pulse 12"; ui_labels[1] = "Pulse 25"; ui_labels[2] = "Pulse 50";
+ui_labels[3] = "Triangle"; ui_labels[4] = "Noise";
+head("SOUND");
+knob(1, "Wave", 0, 0, 4, 1, 0);
+knob(2, "Crush", "%.2f", 0, 1, 0.2, 0);
+head("ENVELOPE");
+knob(3, "Attack", "%.0f ms", 1, 2000, 1, 1);
+knob(4, "Decay", "%.0f ms", 5, 3000, 300, 1);
+knob(5, "Sustain", "%.2f", 0, 1, 0.6, 0);
+knob(6, "Release", "%.0f ms", 5, 3000, 80, 1);
+head("MOTION");
+knob(7, "Vibrato", "%.1f ct", 0, 100, 0, 0);
+knob(8, "Arp", "%.1f Hz", 0, 40, 0, 0);
+head("OUT");
+knob(9, "Level", "%.1f dB", -36, 6, 0, 0);
+
+@block
+atk_inc = 1 / (atk_ms * 0.001 * srate);
+dec_co = exp(-6.9 / (dec_ms * 0.001 * srate));
+rel_co = exp(-6.9 / (rel_ms * 0.001 * srate));
+duty = wave == 0 ? 0.125 : wave == 1 ? 0.25 : 0.5;
+half_levels = 2 ^ (8 - 5 * crush) / 2;
+hold = 1 + floor(crush * crush * 15);
+out_g = 10 ^ (out_db / 20);
+sidx = 0;
+pend = midirecv(mofs, m1, m2, m3);
+
+@sample
+// MIDI, sample-accurate
+while (pend && mofs <= sidx) (
+  mst = m1 & 0xF0;
+  mst == 0x90 && m3 > 0 ? note_on(m2) :
+  mst == 0x80 || mst == 0x90 ? note_off(m2) :
+  mst == 0xB0 && (m2 == 123 || m2 == 120) ? all_off() :
+  mst == 0xE0 ? ( pb = (m3 * 128 + m2 - 8192) / 4096; ctl = 0; ); // +/- 2 semitones
+  pend = midirecv(mofs, m1, m2, m3);
+);
+sidx += 1;
+
+// the arp plays one held key at a time on one channel, which is how chips faked chords
+arp > 0 && n_held > 0 ? (
+  chans[C_ST] == 0 || chans[C_ST] == 3 ? chan_start(chans, held[arp_i]);
+  arp_ph += arp / srate;
+  arp_ph >= 1 ? (
+    arp_ph -= 1;
+    arp_i += 1; arp_i >= n_held ? arp_i = 0;
+    chans[C_NOTE] = held[arp_i];
+    ctl = 0;
+  );
+);
+
+// pitch update every 32 samples, to stay cheap
+ctl -= 1;
+ctl < 0 ? (
+  ctl = 31;
+  vib_ph += 32 * 6 / srate; vib_ph >= 1 ? vib_ph -= 1;
+  vib = vibrato * 0.01 * sin(TWO_PI * vib_ph);
+  c = chans;
+  loop(CHANNELS,
+    c[C_ST] ? c[C_INC] = min(0.5, 440 * 2 ^ ((c[C_NOTE] - 69 + pb + vib) / 12) / srate);
+    c += STRIDE;
+  );
+);
+
+s = 0;
+c = chans;
+loop(CHANNELS,
+  st = c[C_ST];
+  st ? (
+    e = c[C_ENV];
+    st == 1 ? (
+      e += atk_inc;
+      e >= 1 ? ( e = 1; c[C_ST] = 2; );
+    ) : st == 2 ? (
+      e = sus + (e - sus) * dec_co;
+    ) : (
+      e *= rel_co;
+      e < 0.03 ? ( e = 0; c[C_ST] = 0; ); // below the quietest of the 16 volume steps
+    );
+    c[C_ENV] = e;
+
+    p = c[C_PH];
+    wave == 4 ? (
+      // a shift register: the chips' noise, whose pitch follows the note
+      p += min(1, c[C_INC] * 8);
+      p >= 1 ? (
+        p -= 1;
+        r = c[C_LFSR];
+        r = (r >> 1) | (((r ~ (r >> 1)) & 1) << 14);
+        c[C_LFSR] = r;
+      );
+      x = (c[C_LFSR] & 1) * 2 - 1;
+    ) : (
+      p += c[C_INC]; p >= 1 ? p -= 1;
+      wave == 3 ? (
+        i = floor(p * 32); // a triangle in 32 steps, 16 heights
+        x = (i < 16 ? i : 31 - i) / 7.5 - 1;
+      ) : (
+        x = p < duty ? 1 : -1; // shortcut: not band-limited on purpose, since the aliasing is part of the chip sound
+      );
+    );
+    c[C_PH] = p;
+    s += x * floor(e * 15 + 0.5) / 15 * 0.3; // volume moves in 16 steps
+  );
+  c += STRIDE;
+);
+
+// fewer bits and a lower sample rate as Crush goes up
+hold_left -= 1;
+hold_left <= 0 ? (
+  hold_left = hold;
+  hold_s = floor(s * half_levels + 0.5) / half_levels;
+);
+
+// the offset keeps this filter out of slow denormals when everything stops
+dc_y = hold_s - dc_x + dc_k * dc_y + 0.000000000000001;
+dc_x = hold_s;
+
+// hard ceiling: the last line of defence for speakers and ears
+spl0 = spl1 = max(-1, min(1, dc_y * out_g));
+
+@gfx 576 125
+ui_draw("GLounge 8-bit", 34) ? (
+  // a small game pad, drawn in square pixels to suit
+  c_ink();
+  gfx_rect(6, 9, 22, 12);
+  c_paper();
+  gfx_rect(11, 11, 2, 8); // cross
+  gfx_rect(8, 14, 8, 2);
+  gfx_rect(20, 16, 2, 2); // buttons
+  gfx_rect(24, 12, 2, 2);
+);

@@ -10,8 +10,8 @@ A small band of instruments for [REAPER](https://www.reaper.fm/), made for low-s
 |---|---|
 | **Bass** | Ready |
 | **Electric guitar** | Ready |
+| **8-bit** | Ready |
 | Drums | Planned |
-| 8-bit | Planned: a retro video game chip sound |
 | Piano | Planned: a soft, felt-style piano rather than a concert grand |
 
 ## Install
@@ -66,6 +66,23 @@ The bass plays one note at a time, like a single string under your hand. Letting
 | **Level** | Output volume. |
 
 It plays up to 6 notes at once, like six strings. A seventh note takes over the oldest. Letting go of a key damps its string, and pitch bend reaches 2 semitones up or down. For more space, add reverb and delay after it.
+
+## 8-bit
+
+![GLounge 8-bit](docs/8bit.png)
+
+A retro video game chip: four channels, simple waves and volume that moves in steps.
+
+| Knob | What it does |
+|---|---|
+| **Wave** | Pulse 12 is thin and nasal, Pulse 25 is the classic lead, Pulse 50 is hollow, Triangle is the soft game bass, and Noise is for drums and effects. |
+| **Crush** | From clean 8-bit to very crunchy. |
+| **Attack, Decay, Sustain, Release** | The shape of each note. Set Sustain to 0 for short, plucky notes. |
+| **Vibrato** | How far the pitch wobbles, in cents. |
+| **Arp** | Plays held keys one after another at this speed, for those fast game-music chords. At 0, keys sound together, up to 4 at once. |
+| **Level** | Output volume. |
+
+With Noise, higher notes sound brighter, so low notes work for a snare or a rumble and high notes for a hi-hat. Pitch bend reaches 2 semitones up or down.
 
 ## Developers
 
