@@ -12,7 +12,7 @@ A small band of instruments for [REAPER](https://www.reaper.fm/), made for low-s
 | **Electric guitar** | Ready |
 | **8-bit** | Ready |
 | **Drums** | Ready |
-| Piano | Planned: a soft, felt-style piano rather than a concert grand |
+| **Piano** | Ready: closest to a small upright, not a concert grand |
 
 ## Install
 
@@ -113,9 +113,26 @@ A small acoustic-style kit with no samples: it simulates sticks striking skins a
 
 Playing harder is louder and brighter, and no two hits are identical. A closed hat cuts a ringing open hat, like the real pedal. For a bigger space, add reverb after it.
 
+## Piano
+
+![GLounge Piano](docs/piano.png)
+
+An acoustic-style piano with no samples: it simulates a felt hammer striking pairs of stiff strings in a wooden case. It sounds closest to a small, intimate upright, not a bright concert grand.
+
+| Knob | What it does |
+|---|---|
+| **Felt** | How soft the hammer is. Low is clear and present, high is warm and muted. |
+| **Body** | The short wooden knock of the case on every hit. |
+| **Decay** | How long a held note rings, measured around the middle of the keyboard. Low notes ring longer, as on a real piano. |
+| **Detune** | How far apart each note's two strings are. A little adds life. A lot sounds like an old, out-of-tune upright. |
+| **Room** | How much of the room you hear. At 0, it is dry and close. |
+| **Level** | Output volume. |
+
+It plays up to 8 notes at once, and the sustain pedal works (MIDI CC 64). Playing harder is louder and brighter, and low notes sit slightly to one side, as they do from the player's seat.
+
 ## Developers
 
-Each instrument is one `.jsfx` file, and `glounge.jsfx-inc` holds the string model, amp and UI they share. `python3 tests/smoke.py` renders them through REAPER and checks the audio. Pushing a tag like `v0.1.0` builds both downloads and publishes a release.
+Each instrument is one `.jsfx` file, and `glounge.jsfx-inc` holds the string and struck models, amp, room and UI they share. `python3 tests/smoke.py` renders them through REAPER and checks the audio. Pushing a tag like `v0.1.0` builds both downloads and publishes a release.
 
 ## License
 

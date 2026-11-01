@@ -144,6 +144,159 @@ function amp(s) local(x)
   max(-1, min(1, t2 * out_g));
 );
 
+// the fall per sample for a sound that dies away in this many seconds
+function fall(seconds) ( exp(-6.9 / (seconds * srate)); );
+
+// ---- struck things: a few resonators per voice, excited by one soft push. Adds to out_l and out_r.
+M_A1 = 0; M_A2 = 1; M_G = 2; M_Y1 = 3; M_Y2 = 4; M_W = 5; M_R = 6;
+MS = 7;
+D_MODES = 0; D_COUNT = 1; D_LEFT = 2; D_EX = 3; D_EXN = 4; D_AMP = 5; D_CLICK = 6; D_DROOP = 7; D_DFALL = 8; D_PAN = 9; D_NOTE = 10; D_KEY = 11;
+DS = 12;
+
+function modal_setup(count, max_modes, gain) local(i, modes)
+(
+  n_skins = count;
+  modal_gain = gain;
+  skins = alloc(count * DS);
+  modes = alloc(count * max_modes * MS);
+  memset(skins, 0, count * DS);
+  memset(modes, 0, count * max_modes * MS);
+  i = 0;
+  loop(count, skins[i * DS + D_MODES] = modes + i * max_modes * MS; i += 1; );
+);
+
+function mode(d, i, hz, amp, secs) local(m, w, r)
+(
+  m = d[D_MODES] + i * MS;
+  w = TWO_PI * min(hz, srate * 0.45) / srate;
+  r = fall(secs);
+  m[M_W] = w; m[M_R] = r;
+  m[M_A1] = 2 * r * cos(w); m[M_A2] = -r * r;
+  m[M_G] = amp * sin(w); // so a short strike rings at about amp, whatever the pitch
+);
+
+// A stick or hammer stays on for a moment, and the shorter the moment the brighter the hit.
+// The resonators keep their state, so a new hit joins the ringing voice instead of cutting it.
+function strike(d, count, contact_ms, a, click, longest, droop, droop_s)
+(
+  d[D_COUNT] = count;
+  d[D_EXN] = d[D_EX] = max(2, floor(contact_ms * 0.001 * srate));
+  d[D_AMP] = a; d[D_CLICK] = click;
+  d[D_LEFT] = longest * srate;
+  d[D_DROOP] = droop; d[D_DFALL] = exp(-6.9 * 32 / (droop_s * srate));
+);
+
+// a damper landing on the strings: everything falls away in this many seconds
+function skin_damp(d, secs) local(m, r)
+(
+  r = fall(secs);
+  m = d[D_MODES];
+  loop(d[D_COUNT],
+    m[M_R] = r;
+    m[M_A1] = 2 * r * cos(m[M_W]); m[M_A2] = -r * r;
+    m += MS;
+  );
+  d[D_LEFT] = min(d[D_LEFT], secs * srate);
+);
+
+function skin_clear(d) local(m)
+(
+  m = d[D_MODES];
+  loop(d[D_COUNT], m[M_Y1] = m[M_Y2] = 0; m += MS; );
+);
+
+function modal_tick() local(d, m, x, y, o)
+(
+  // the pitch sinks a little as a hit fades: slow enough to update every 32 samples
+  modal_ctl -= 1;
+  modal_ctl < 0 ? (
+    modal_ctl = 31;
+    d = skins;
+    loop(n_skins,
+      d[D_LEFT] > 0 && d[D_DROOP] > 0.001 ? (
+        d[D_DROOP] *= d[D_DFALL];
+        m = d[D_MODES];
+        loop(d[D_COUNT],
+          m[M_A1] = 2 * m[M_R] * cos(m[M_W] * (1 + d[D_DROOP]));
+          m += MS;
+        );
+      );
+      d += DS;
+    );
+  );
+
+  // each voice only costs CPU while it rings
+  d = skins;
+  loop(n_skins,
+    d[D_LEFT] > 0 ? (
+      d[D_LEFT] -= 1;
+      x = 0; o = 0;
+      d[D_EX] > 0 ? (
+        // the contact: one smooth push, plus the small noise of the stick
+        y = (1 - cos(TWO_PI * (1 - d[D_EX] / d[D_EXN]))) * d[D_AMP];
+        x = y / d[D_EXN];
+        o = y * (rand(2) - 1) * d[D_CLICK];
+        d[D_EX] -= 1;
+      );
+      m = d[D_MODES];
+      loop(d[D_COUNT],
+        y = m[M_A1] * m[M_Y1] + m[M_A2] * m[M_Y2] + m[M_G] * x;
+        m[M_Y2] = m[M_Y1]; m[M_Y1] = y;
+        o += y;
+        m += MS;
+      );
+      o *= modal_gain;
+      out_l += o * (1 - d[D_PAN]);
+      out_r += o * (1 + d[D_PAN]);
+    );
+    d += DS;
+  );
+);
+
+// ---- a small room: four short echoes feeding each other, darker on every pass. Reads the room slider.
+function room_setup() local(i)
+(
+  RN = ceil(0.04 * srate);
+  rbuf = alloc(4 * RN);
+  memset(rbuf, 0, 4 * RN);
+  rlen = alloc(4); rz = alloc(4); rx = alloc(4); rg = alloc(4);
+  memset(rz, 0, 4);
+  rlen[0] = floor(0.0131 * srate); rlen[1] = floor(0.0173 * srate);
+  rlen[2] = floor(0.0227 * srate); rlen[3] = floor(0.0293 * srate);
+  i = 0; loop(4, rg[i] = 10 ^ (-3 * rlen[i] / (0.5 * srate)); i += 1; );
+  r_damp = 1 - exp(-TWO_PI * 3500 / srate);
+  room_on = 0; r_w = 0;
+);
+
+function room_block()
+(
+  // a room coming back starts empty, or it would replay what it froze with
+  room > 0 && !room_on ? ( memset(rbuf, 0, 4 * RN); memset(rz, 0, 4); );
+  room_on = room > 0;
+);
+
+function room_tick() local(x, y, o, i)
+(
+  room_on ? (
+    // a Householder mix of four echoes, the feedback shape that never rings at one note
+    x = (out_l + out_r) * 0.5 * room + 0.000000000000001;
+    y = 0; i = 0;
+    loop(4,
+      o = rbuf[i * RN + (r_w >= rlen[i] ? r_w - rlen[i] : r_w - rlen[i] + RN)];
+      rz[i] += r_damp * (o - rz[i]);
+      o = rz[i] * rg[i];
+      rx[i] = o; y += o;
+      i += 1;
+    );
+    y *= 0.5;
+    i = 0;
+    loop(4, rbuf[i * RN + r_w] = rx[i] - y + x; i += 1; );
+    r_w += 1; r_w >= RN ? r_w = 0;
+    out_l += (rx[0] + rx[2]) * 0.7;
+    out_r += (rx[1] + rx[3]) * 0.7;
+  );
+);
+
 // ---- UI
 function c_paper() ( gfx_set(0.95, 0.94, 0.92); );
 function c_card() ( gfx_set(0.90, 0.89, 0.86); );

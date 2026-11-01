@@ -10,9 +10,9 @@ CLEAN = {DRIVE: 0, TONE: 8000}
 PLUGIN = "bass.jsfx"
 
 
-def project(path, out, params, notes, seconds, rate, bend_at=None):
+def project(path, out, params, notes, seconds, rate, bend_at=None, pedal=None):
     """notes: (start_beat, length_beats, midi_note[, velocity]). 120 BPM, 960 ticks per beat.
-    bend_at: the beat where the pitch wheel jumps fully up."""
+    bend_at: the beat where the pitch wheel jumps fully up. pedal: (down_beat, up_beat) for the sustain pedal."""
     src = open(os.path.join(ROOT, PLUGIN)).read()
     defaults = {int(n): v for n, v in re.findall(r"^slider(\d+):\w+=(-?[\d.]+)", src, re.M)}
     vals = " ".join(str(params.get(i, defaults.get(i, "-"))) for i in range(1, 65))
@@ -21,6 +21,7 @@ def project(path, out, params, notes, seconds, rate, bend_at=None):
         [(int(s * 960), 0x90, n, v[0] if v else 110) for s, _, n, *v in notes]
         + [(int((s + l) * 960), 0x80, n, 0) for s, l, n, *_ in notes]
         + ([(int(bend_at * 960), 0xE0, 127, 127)] if bend_at else [])
+        + ([(int(pedal[0] * 960), 0xB0, 64, 127), (int(pedal[1] * 960), 0xB0, 64, 0)] if pedal else [])
     ):
         events.append(f"E {tick - last} {status:02x} {note:02x} {vel:02x}")
         last = tick
@@ -70,9 +71,9 @@ def project(path, out, params, notes, seconds, rate, bend_at=None):
 """)
 
 
-def render(tmp, name, params, notes, seconds, rate=44100, bend_at=None):
+def render(tmp, name, params, notes, seconds, rate=44100, bend_at=None, pedal=None):
     rpp, out = os.path.join(tmp, name + ".rpp"), os.path.join(tmp, name + ".wav")
-    project(rpp, out, params, notes, seconds, rate, bend_at)
+    project(rpp, out, params, notes, seconds, rate, bend_at, pedal)
     subprocess.run(
         ["reaper", "-cfgfile", os.path.join(tmp, "cfg", "reaper.ini"), "-newinst", "-nosplash",
          "-ignoreerrors", "-renderproject", rpp],
@@ -157,7 +158,7 @@ def main():
     for f in glob.glob(os.path.join(ROOT, "*.jsfx*")):
         shutil.copy(f, os.path.join(tmp, "cfg", "Effects"))
     open(os.path.join(tmp, "cfg", "reaper.ini"), "w").close()
-    good = name_checks() & bass_checks(tmp) & guitar_checks(tmp) & eightbit_checks(tmp) & drums_checks(tmp)
+    good = name_checks() & bass_checks(tmp) & guitar_checks(tmp) & eightbit_checks(tmp) & drums_checks(tmp) & piano_checks(tmp)
     print("PASS" if good else "FAILED")
     sys.exit(0 if good else 1)
 
@@ -165,10 +166,11 @@ def main():
 def name_checks():
     """JSFX names ignore case, so count and COUNT are one variable. This bug is silent, and has bitten repeatedly."""
     good = True
-    for path in glob.glob(os.path.join(ROOT, "*.jsfx*")):
-        code = re.sub(r"^(desc|slider\d+|import).*$|//.*|\"[^\"]*\"", "", open(path).read(), flags=re.M)
+    strip = lambda path: re.sub(r"^(desc|slider\d+|import).*$|//.*|\"[^\"]*\"", "", open(path).read(), flags=re.M)
+    shared = strip(os.path.join(ROOT, "glounge.jsfx-inc"))  # compiled into every plugin, so check each with it
+    for path in glob.glob(os.path.join(ROOT, "*.jsfx")):
         seen = {}
-        for word in re.findall(r"[A-Za-z_][A-Za-z_0-9]*", code):
+        for word in re.findall(r"[A-Za-z_][A-Za-z_0-9]*", strip(path) + shared):
             seen.setdefault(word.lower(), set()).add(word)
         clashes = [sorted(v) for v in seen.values() if len(v) > 1]
         good &= check(not clashes, f"{os.path.basename(path)} has no names that differ only by case {clashes or ''}")
@@ -182,6 +184,107 @@ def level_at(x, rate, hz):
         total += s * (0.5 - 0.5 * math.cos(2 * math.pi * i / n)) * phase
         phase *= step
     return abs(total) / n
+
+
+def piano_checks(tmp):
+    global PLUGIN
+    PLUGIN = "piano.jsfx"
+    print("--- piano")
+    FELT, NOISE, P_DECAY, DETUNE, ROOM, LVL = range(1, 7)
+    tuned = {ROOM: 0, NOISE: 0, DETUNE: 0}  # two detuned strings have no single pitch to measure
+    dry = {ROOM: 0, NOISE: 0}
+    sr = 44100
+    good = True
+    note = lambda n, params=dry, vel=100, beats=8, secs=4, rate=44100: render(
+        tmp, f"p{n}", params, [(0, beats, n, vel)], secs, rate=rate)[0]
+
+    x = render(tmp, "pdefault", {}, [(0, 4, n) for n in (48, 55, 60, 64, 67)], 3)[0]
+    good &= check(rms(x[:sr]) > 0.02 and peak(x) < 0.99, f"a chord sounds and does not clip (rms {rms(x[:sr]):.3f}, peak {peak(x):.3f})")
+
+    for rate in (44100, 96000):
+        for n in (21, 36, 48, 60, 72, 84, 90, 96, 102, 108):
+            x = note(n, tuned, rate=rate)
+            hz = 440 * 2 ** ((n - 69) / 12)
+            y = x[int(0.15 * rate):int(0.95 * rate)]
+            if rate != 44100:
+                y = y[::2]  # shortcut: keeps the scan quick; 48 kHz is plenty for these notes
+            c = cents_off(y, rate // (2 if rate != 44100 else 1), hz)
+            good &= check(abs(c) <= 3, f"note {n} in tune at {rate} Hz ({c:+d} cents)")
+
+    # treble notes must ring, not vanish: a short string passes its loss filter thousands of times a second
+    for n in (84, 96, 108):
+        x = note(n, tuned)
+        a, b = rms(x[int(0.02 * sr):int(0.12 * sr)]), rms(x[int(0.3 * sr):int(0.4 * sr)])
+        good &= check(b > 0.1 * a, f"note {n} still rings after 0.3 s ({a:.4f} -> {b:.4f})")
+
+    # the whole keyboard is usable, with no dead or screaming zones
+    levels = {n: rms(note(n, beats=2)[:sr // 2]) for n in (21, 36, 48, 60, 72, 84, 96, 108)}
+    good &= check(max(levels.values()) < 8 * min(levels.values()), "the keyboard is balanced: " + ", ".join(f"{n}={v:.3f}" for n, v in levels.items()))
+
+    # strings are stiff, so the partials run sharp of the pure harmonic series
+    x = note(36, {**dry, DETUNE: 0, FELT: 0})[int(0.1 * sr):int(1.1 * sr)]
+    hz = 440 * 2 ** ((36 - 69) / 12)
+    c = cents_off(x, sr, hz * 5)
+    good &= check(2 <= c <= 14, f"the fifth partial runs a little sharp, as on a real piano ({c:+d} cents)")
+
+    # what makes it acoustic rather than an electric piano: a real string has many partials, and the case knocks
+    hz = 440 * 2 ** ((36 - 69) / 12)
+    x = note(36, tuned, vel=110)[int(0.02 * sr):int(0.4 * sr)]
+    a = bright(x, sr, 800)
+    good &= check(a > 0.02, f"low notes reach far past their ninth partial ({a:.4f} of the energy above 800 Hz)")
+    a, b = rms(note(60, {ROOM: 0, NOISE: 0}, vel=100)[:sr // 40]), rms(note(60, {ROOM: 0, NOISE: 1}, vel=100)[:sr // 40])
+    good &= check(b > 1.1 * a, f"Body adds the case's knock to the attack ({a:.4f} -> {b:.4f})")
+    def knock_only(n):
+        return rms(render(tmp, "pk", {ROOM: 0, NOISE: 1, P_DECAY: 2, LVL: 6}, [(0, 8, n)], 1)[0][:sr // 40])
+    good &= check(knock_only(60) > 0.03, f"the knock is clearly there ({knock_only(60):.4f})")
+
+    # keys, dampers and the pedal
+    x = note(60, beats=1)
+    good &= check(rms(x[int(1.5 * sr):]) < 1e-3, f"letting go damps the note (rms {rms(x[int(1.5 * sr):]):.5f})")
+    x = render(tmp, "pped", dry, [(0, 1, 60)], 5, pedal=(0, 6))[0]
+    damped = rms(note(60, beats=1)[int(1.5 * sr):int(2 * sr)])
+    good &= check(rms(x[int(1.5 * sr):int(2 * sr)]) > 20 * max(damped, 1e-5), f"the pedal keeps it ringing (rms {rms(x[int(1.5 * sr):int(2 * sr)]):.4f}, without {damped:.5f})")
+    good &= check(rms(x[int(4 * sr):]) < 1e-3, f"lifting the pedal damps it (rms {rms(x[int(4 * sr):]):.5f})")
+    x = render(tmp, "ppkey", dry, [(0, 8, 60)], 5, pedal=(0, 2))[0]
+    good &= check(rms(x[int(2 * sr):int(3 * sr)]) > 20 * max(damped, 1e-5), "a key still held survives lifting the pedal")
+    x = render(tmp, "ppoly", {**dry, DETUNE: 0}, [(0, 8, 48), (0, 8, 55)], 3)[0][int(0.2 * sr):int(1.2 * sr)]
+    good &= check(abs(cents_off(x, sr, 130.81)) <= 3 and abs(cents_off(x, sr, 196.0)) <= 3, "two notes ring together, both in tune")
+    x = render(tmp, "psteal", dry, [(0, 1, 40 + i * 2) for i in range(14)], 4)[0]
+    good &= check(rms(x[:sr // 2]) > 0.01 and rms(x[int(2.5 * sr):]) < 1e-3, "14 notes at once leave nothing stuck")
+    x = render(tmp, "prep", dry, [(i * 0.25, 0.2, 60) for i in range(24)], 5)[0]
+    good &= check(peak(x) < 0.99 and rms(x[int(4.5 * sr):]) < 1e-3, f"a fast repeated note does not build up (peak {peak(x):.3f})")
+
+    # the knobs do what their names say
+    a, b = bright(note(60, {**dry, FELT: 1}), sr), bright(note(60, {**dry, FELT: 0}), sr)
+    good &= check(b > 1.5 * a, f"Felt softens the sound ({b:.4f} without, {a:.4f} with)")
+    a, b = bright(note(60, vel=30), sr), bright(note(60, vel=127), sr)
+    good &= check(b > 1.2 * a, f"harder hits are brighter ({a:.4f} -> {b:.4f})")
+    a, b = rms(note(60, vel=30)[:sr // 2]), rms(note(60, vel=127)[:sr // 2])
+    good &= check(b > 2 * a, f"harder hits are louder ({a:.3f} -> {b:.3f})")
+    a = time_to_fall(render(tmp, "pd0", {**dry, P_DECAY: 2}, [(0, 16, 60)], 8)[0], sr)
+    b = time_to_fall(render(tmp, "pd1", {**dry, P_DECAY: 25}, [(0, 16, 60)], 8)[0], sr)
+    good &= check(b > 2 * a, f"Decay lengthens the note ({a:.2f}s -> {b:.2f}s)")
+    def wobble(x):
+        w = sr // 20
+        levels = [rms(x[i:i + w]) for i in range(int(0.2 * sr), int(2.2 * sr), w)]
+        trend = [levels[i] / max(levels[i + 1], 1e-9) for i in range(len(levels) - 1)]
+        return max(trend) - min(trend)
+    a, b = wobble(note(48, {**dry, DETUNE: 0})), wobble(note(48, {**dry, DETUNE: 6}))
+    good &= check(b > 1.5 * a, f"Detune makes the note beat ({a:.3f} -> {b:.3f})")
+    a, b = rms(note(60, beats=1)[int(0.85 * sr):int(1.2 * sr)]), rms(note(60, {ROOM: 1, NOISE: 0}, beats=1)[int(0.85 * sr):int(1.2 * sr)])
+    good &= check(b > 1.5 * max(a, 1e-5), f"Room adds a tail ({a:.5f} -> {b:.5f})")
+    l, r, _ = render(tmp, "ppan", dry, [(0, 2, 36)], 1), None, None
+    good &= check(rms(l[0]) > 1.2 * rms(l[1]), f"low notes sit to one side, like a keyboard (L {rms(l[0]):.3f}, R {rms(l[1]):.3f})")
+
+    # every MIDI note, even far above a real piano, must stay stable: a short string once ran away at full volume
+    for n in (108, 112, 116, 120, 124, 127):
+        x = note(n, {FELT: 0, NOISE: 0, P_DECAY: 25, DETUNE: 6, ROOM: 0, LVL: 6}, vel=127, beats=1, secs=3)
+        good &= check(rms(x[int(2 * sr):]) < 1e-3, f"note {n} fades away after release (end {rms(x[int(2 * sr):]):.6f})")
+
+    # the loudest, longest settings across the whole keyboard stay finite, and fade once released
+    x = render(tmp, "pall", {FELT: 0, NOISE: 1, P_DECAY: 25, DETUNE: 6, ROOM: 1, LVL: 6}, [(i * 0.05, 1, n, 127) for i, n in enumerate(range(0, 128, 7))], 6)[0]
+    good &= check(all(math.isfinite(s) for s in x) and peak(x) <= 1.001 and rms(x[int(5 * sr):]) < 1e-2, f"the whole keyboard at maximum stays safe (peak {peak(x):.3f}, end {rms(x[int(5 * sr):]):.5f})")
+    return good
 
 
 def crossing_hz(x, rate):

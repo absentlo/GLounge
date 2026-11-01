@@ -1,0 +1,270 @@
+desc:GLounge Piano
+options:no_meter
+in_pin:none
+out_pin:Left
+out_pin:Right
+
+slider1:felt=0.35<0,1,0.001>-Felt
+slider2:noise=0.5<0,1,0.001>-Body
+slider3:p_decay=10<2,25,0.01:log>-Decay
+slider4:detune=0.5<0,6,0.01>-Detune
+slider5:room=0.3<0,1,0.001>-Room
+slider6:out_db=0<-36,6,0.1>-Level
+
+import glounge.jsfx-inc
+
+@init
+// ---- each key is two real strings: delay lines one period long, fed back through what stiffness and air do to a wave
+N_KEYS = 8;
+STRINGS = 2;
+BN = ceil(0.15 * srate) + 8; // long enough for the lowest notes
+DISPERSE = 3; // allpass stages that make high partials run sharp, as stiff piano wire does
+
+K_LEFT = 0; K_NOTE = 1; K_KEY = 2; K_ENV = 3; K_DAMP = 4; K_PAN = 5; K_EX = 6; K_EXN = 7; K_AMP = 8; K_STR = 9;
+S_BUF = 0; S_W = 1; S_N = 2; S_POS = 3; S_C = 4; S_A1 = 5; S_A2 = 6; S_LP = 7; S_B = 8; S_G = 9; S_AD = 10; S_DS = 11; // S_DS: the stages' in/out pairs
+SS = S_DS + 2 * DISPERSE;
+KS = K_STR + STRINGS * SS;
+keys = alloc(N_KEYS * KS);
+memset(keys, 0, N_KEYS * KS);
+i = 0;
+loop(N_KEYS * STRINGS,
+  keys[floor(i / STRINGS) * KS + K_STR + (i % STRINGS) * SS + S_BUF] = alloc(BN);
+  i += 1;
+);
+memset(keys[K_STR + S_BUF], 0, N_KEYS * STRINGS * BN);
+rel_co = exp(-6.9 / (0.5 * srate));
+dc_k = 1 - TWO_PI * 25 / srate;
+
+// the case and soundboard answer every hit with a short wooden knock
+modal_setup(1, 6, 1);
+room_setup();
+pedal = 0;
+
+// how many samples the wave spends in a first-order allpass, at this pitch
+function ap_delay(c, w) ( (w - 2 * atan2(c * sin(w), 1 + c * cos(w))) / w; );
+
+// sets one string's length, stiffness and loss, so pitch and decay stay right at every note
+function tune(s, f, t, b, ad) local(w, cs, sn, rest, n, d, c, target)
+(
+  f = min(f, srate * 0.2);
+  w = TWO_PI * f / srate; cs = cos(w); sn = sin(w);
+  rest = srate / f - atan2(b * sn, 1 - b * cs) / w - DISPERSE * ap_delay(ad, w);
+  n = max(2, floor(rest - 0.5));
+  // Clamped: above the piano's range a string is too short for this delay, and d <= 0 would make the
+  // allpass unstable, so the output would run away. Those notes go out of tune instead.
+  target = rest - n;
+  d = target;
+  loop(4, // the allpass's delay shifts with pitch, so home in on the right value
+    d = max(0.1, min(1.9, d));
+    c = (1 - d) / (1 + d);
+    d += target - ap_delay(c, w);
+  );
+  s[S_N] = n; s[S_C] = c; s[S_B] = b; s[S_AD] = ad;
+  s[S_POS] = max(1, floor(n / 8)); // the hammer hits one eighth along the string
+  // below 1 at DC too, or the string would grow instead of decaying
+  s[S_G] = min(0.99995, 10 ^ (-3 / (f * t)) * sqrt(1 - 2 * b * cs + b * b) / (1 - b));
+);
+
+function play(k, n, vel) local(f, t, b, ad, ms_on, a, s, i)
+(
+  f = 440 * 2 ^ ((n - 69) / 12);
+  t = min(25, p_decay * 2 ^ (-(n - 48) / 24));
+  // a short string passes this filter thousands of times a second, so it must sit far above the note, or the note dies at once
+  b = exp(-TWO_PI * max(2600 * 2 ^ ((n - 48) / 24), 12 * f) / srate);
+  // the stiffness shows just above each note's own pitch, so the stages are placed relative to it
+  ad = -(1 - min(0.6, 13 * TWO_PI * f / srate));
+  s = k + K_STR;
+  tune(s, f * 2 ^ (detune / 1200), t, b, ad);
+  tune(s + SS, f * 2 ^ (-detune / 1200), t * 0.85, b, ad); // never quite equal, which is the piano's bloom
+  // felt and a gentle touch stay on the string longer, and so sound darker. A treble note's period limits it.
+  ms_on = min((0.3 + 3 * felt) * (1.6 - 1.2 * vel), 800 / f);
+  k[K_EXN] = k[K_EX] = max(2, floor(ms_on * 0.001 * srate));
+  // lifted towards the treble, where a short string carries less and fades sooner
+  a = (0.2 + 0.8 * vel * vel) * 2 ^ (max(0, n - 72) / 15);
+  k[K_AMP] = a;
+  k[K_LEFT] = t * srate; k[K_ENV] = 1; k[K_DAMP] = 0;
+  k[K_PAN] = (n - 60) / 80;
+);
+
+function knock(a) local(d)
+(
+  d = skins;
+  mode(d, 0, 110, 0.5, 0.09);
+  mode(d, 1, 196, 0.5, 0.07);
+  mode(d, 2, 330, 0.4, 0.06);
+  mode(d, 3, 540, 0.3, 0.05);
+  mode(d, 4, 910, 0.2, 0.035);
+  mode(d, 5, 1600, 0.12, 0.025);
+  strike(d, 6, 1.2, a * noise * 0.35, 0.15, 0.1, 0, 1);
+);
+
+function clear_key(k) local(s, i)
+(
+  s = k + K_STR;
+  loop(STRINGS,
+    memset(s[S_BUF], 0, BN);
+    s[S_A1] = s[S_A2] = s[S_LP] = 0;
+    i = 0; loop(2 * DISPERSE, s[S_DS + i] = 0; i += 1; );
+    s += SS;
+  );
+);
+
+function damp(k) local(s, f)
+(
+  k[K_DAMP] == 0 ? (
+    k[K_DAMP] = 1;
+    // a felt damper lands on the strings: only a little loss each pass, quickly, then the fade takes it
+    s = k + K_STR;
+    loop(STRINGS, s[S_G] *= 0.985; s += SS; );
+  );
+);
+
+function note_on(n, vel) local(k, best, low, score)
+(
+  best = keys; low = 1000000000; k = keys;
+  loop(N_KEYS,
+    // the same key again first, then a free voice, then the one with the least left to ring
+    score = k[K_LEFT] <= 0 ? -1 : k[K_NOTE] == n ? -2 : k[K_LEFT] + (k[K_KEY] ? srate * 100 : 0);
+    score < low ? ( low = score; best = k; );
+    k += KS;
+  );
+  // shortcut: a stolen voice restarts from silence, which can tick if it was still loud; add voices if big pedalled chords need it
+  best[K_NOTE] != n || best[K_LEFT] <= 0 ? clear_key(best);
+  best[K_NOTE] = n; best[K_KEY] = 1;
+  play(best, n, vel);
+  knock(0.2 + 0.8 * vel);
+);
+
+function note_off(n) local(k)
+(
+  k = keys;
+  loop(N_KEYS,
+    k[K_NOTE] == n && k[K_KEY] ? (
+      k[K_KEY] = 0;
+      !pedal ? ( damp(k); knock(0.12); );
+    );
+    k += KS;
+  );
+);
+
+function pedal_set(down) local(k)
+(
+  pedal = down;
+  !pedal ? (
+    k = keys;
+    loop(N_KEYS, !k[K_KEY] && k[K_LEFT] > 0 ? damp(k); k += KS; );
+  );
+);
+
+function all_off() local(k)
+(
+  pedal = 0;
+  k = keys;
+  loop(N_KEYS, k[K_KEY] = 0; k[K_LEFT] > 0 ? damp(k); k += KS; );
+);
+
+ui_setup();
+head("HAMMER");
+knob(1, "Felt", "%.2f", 0, 1, 0.35, 0);
+knob(2, "Body", "%.2f", 0, 1, 0.5, 0);
+head("STRINGS");
+knob(3, "Decay", "%.1f s", 2, 25, 10, 1);
+knob(4, "Detune", "%.1f ct", 0, 6, 0.5, 0);
+head("SPACE");
+knob(5, "Room", "%.2f", 0, 1, 0.3, 0);
+head("OUT");
+knob(6, "Level", "%.1f dB", -36, 6, 0, 0);
+
+@block
+out_g = 0.8 * 10 ^ (out_db / 20);
+room_block();
+sidx = 0;
+pend = midirecv(mofs, m1, m2, m3);
+
+@sample
+// MIDI, sample-accurate
+while (pend && mofs <= sidx) (
+  mst = m1 & 0xF0;
+  mst == 0x90 && m3 > 0 ? note_on(m2, m3 / 127) :
+  mst == 0x80 || mst == 0x90 ? note_off(m2) :
+  mst == 0xB0 && m2 == 64 ? pedal_set(m3 >= 64) :
+  mst == 0xB0 && (m2 == 123 || m2 == 120) ? all_off();
+  pend = midirecv(mofs, m1, m2, m3);
+);
+sidx += 1;
+
+out_l = out_r = 0;
+
+// each key only costs CPU while it rings
+k = keys;
+loop(N_KEYS,
+  k[K_LEFT] > 0 ? (
+    k[K_LEFT] -= 1;
+    // the hammer: one smooth push, added into the moving wave
+    h = 0;
+    k[K_EX] > 0 ? (
+      h = (1 - cos(TWO_PI * (1 - k[K_EX] / k[K_EXN]))) * k[K_AMP];
+      k[K_EX] -= 1;
+    );
+    o = 0;
+    s = k + K_STR;
+    loop(STRINGS,
+      buf = s[S_BUF]; w = s[S_W];
+      r = w - s[S_N]; r < 0 ? r += BN;
+      x = buf[r];
+      o = o * 0.55 + x; // one string louder, so they waver without ever cancelling
+      ad = s[S_AD]; i = S_DS;
+      loop(DISPERSE,
+        y = ad * x + s[i] - ad * s[i + 1];
+        s[i] = x; s[i + 1] = y;
+        x = y;
+        i += 2;
+      );
+      y = s[S_C] * x + s[S_A1] - s[S_C] * s[S_A2];
+      s[S_A1] = x; s[S_A2] = y;
+      lp = y + s[S_B] * (s[S_LP] - y);
+      s[S_LP] = lp;
+      buf[w] = lp * s[S_G] + h;
+      // the wave leaving the hammer both ways: pushing here and pulling there also keeps the string free of DC
+      h != 0 ? (
+        r = w - s[S_POS]; r < 0 ? r += BN;
+        buf[r] -= h;
+      );
+      w += 1; s[S_W] = w >= BN ? 0 : w;
+      s += SS;
+    );
+    o *= k[K_ENV] * 0.13;
+    out_l += o * (1 - k[K_PAN]);
+    out_r += o * (1 + k[K_PAN]);
+    k[K_DAMP] ? (
+      k[K_ENV] *= rel_co;
+      k[K_ENV] < 0.001 ? k[K_LEFT] = 0;
+    );
+  );
+  k += KS;
+);
+
+// the offset keeps these filters out of slow denormals once the strings stop
+dc_l = out_l - dc_xl + dc_k * dc_l + 0.000000000000001; dc_xl = out_l; out_l = dc_l;
+dc_r = out_r - dc_xr + dc_k * dc_r + 0.000000000000001; dc_xr = out_r; out_r = dc_r;
+
+modal_tick();
+room_tick();
+
+// hard ceiling: the last line of defence for speakers and ears
+spl0 = max(-1, min(1, out_l * out_g));
+spl1 = max(-1, min(1, out_r * out_g));
+
+@gfx 384 125
+ui_draw("GLounge Piano", 34) ? (
+  // a small keyboard
+  c_ink();
+  gfx_rect(6, 8, 23, 14);
+  c_paper();
+  g_i = 0;
+  loop(4, gfx_rect(7 + g_i * 5.5, 9, 4, 12); g_i += 1; );
+  c_ink();
+  gfx_rect(10, 9, 3, 7);
+  gfx_rect(15, 9, 3, 7);
+  gfx_rect(21, 9, 3, 7);
+);
